@@ -92,6 +92,9 @@ class RestaurantOrderBot {
           await this.updateGroupOrderStatus(chatId, orderGroupId, newStatus);
         } else if (data === 'back_to_group_orders') {
           await this.viewGroupOrders(chatId);
+        } else if (data.startsWith('view_worker_group_order_')) {
+          const orderGroupId = data.split('_')[4];
+          await this.showGroupOrderDetails(chatId, orderGroupId);
         }
       } catch (error) {
         logger.error('Callback query error:', error);
@@ -498,6 +501,43 @@ class RestaurantOrderBot {
     });
 
     await this.bot.sendMessage(chatId, 'Please enter your phone number (e.g., +1234567890).');
+  }
+
+  async startAddMenuItem(chatId, restaurantId) {
+    this.setUserState(chatId, {
+      expecting: 'menu_item',
+      selectedRestaurantId: restaurantId
+    });
+    await this.bot.sendMessage(chatId, 'Enter the menu item name and price separated by a comma (e.g., "Pizza, 10.99"):');
+  }
+
+  async viewAdminOrders(chatId) {
+    try {
+      const [orders] = await this.pool.execute(`
+        SELECT o.id, o.status, r.name AS restaurant_name, o.created_at 
+        FROM orders o
+        JOIN restaurants r ON o.restaurant_id = r.id
+        WHERE r.admin_id = ?
+      `, [chatId]);
+  
+      if (orders.length === 0) {
+        await this.bot.sendMessage(chatId, 'No orders found.');
+        return;
+      }
+  
+      let message = 'Orders:\n\n';
+      orders.forEach(order => {
+        message += `Order ID: ${order.id}\n`;
+        message += `Restaurant: ${order.restaurant_name}\n`;
+        message += `Status: ${order.status}\n`;
+        message += `Date: ${order.created_at}\n\n`;
+      });
+  
+      await this.bot.sendMessage(chatId, message);
+    } catch (error) {
+      logger.error('Error viewing admin orders:', error);
+      await this.bot.sendMessage(chatId, 'Failed to retrieve orders.');
+    }
   }
 
   async processPhoneNumberRegistration(msg) {
