@@ -52,6 +52,8 @@ class RestaurantOrderBot {
         await this.processAddMenuItem(msg);
       } else if (userState.expecting === 'worker_group_order') {
         await this.processWorkerGroupOrder(msg);
+      } else if (userState.expecting === 'company_name') {
+        await this.processCompanyRegistration(msg);
       }
     });
 
@@ -92,10 +94,22 @@ class RestaurantOrderBot {
           await this.updateGroupOrderStatus(chatId, orderGroupId, newStatus);
         } else if (data === 'back_to_group_orders') {
           await this.viewGroupOrders(chatId);
+        } else if (data.startsWith('select_company_')) {
+          const companyId = data.split('_')[2];
+          await this.pool.execute('UPDATE users SET company_id = ? WHERE user_id = ?', [companyId, chatId]);
+          this.clearUserState(chatId);
+          await this.showRoleMenu(chatId, 'worker');
+          await this.bot.sendMessage(chatId, `Registered with company ID ${companyId}`);
+        
         } else if (data.startsWith('view_worker_group_order_')) {
           const orderGroupId = data.split('_')[4];
           await this.showGroupOrderDetails(chatId, orderGroupId);
-        }
+        } 
+        
+        //else if (userState.expecting === 'company_name') {
+        //  await this.processCompanyRegistration(msg);
+        // }
+        
       } catch (error) {
         logger.error('Callback query error:', error);
       }
@@ -114,6 +128,42 @@ class RestaurantOrderBot {
         await this.handleWorkerActions(msg, user);
       }
     });
+  }
+
+  async processCompanyRegistration(msg) {
+    const chatId = msg.chat.id;
+    const companyName = msg.text.trim();
+  
+    try {
+      let [companies] = await this.pool.execute('SELECT id FROM companies WHERE name = ?', [companyName]);
+      let companyId;
+  
+      if (companies.length === 0) {
+        const [insertResult] = await this.pool.execute('INSERT INTO companies (name) VALUES (?)', [companyName]);
+        companyId = insertResult.insertId;
+      } else {
+        companyId = companies[0].id;
+      }
+  
+      await this.pool.execute('UPDATE users SET company_id = ? WHERE user_id = ?', [companyId, chatId]);
+  
+      // Retrieve UUID from database
+      const [userRows] = await this.pool.execute('SELECT uuid FROM users WHERE user_id = ?', [chatId]);
+      const uuid = userRows[0].uuid;
+  
+      this.clearUserState(chatId);
+      await this.showRoleMenu(chatId, 'admin');
+      await this.bot.sendMessage(chatId, `Company "${companyName}" registered successfully!`);
+      await this.bot.sendMessage(
+        chatId,
+        `✅ Admin registration successful!\n` +
+        `🔑 Your UUID: ${uuid}\n` +
+        `You can now manage restaurants and orders.`
+      );
+    } catch (error) {
+      logger.error('Company registration error:', error);
+      await this.bot.sendMessage(chatId, 'Failed to register company. Please try again.');
+    }
   }
 
   async createGroupOrder(chatId, restaurantId) {
@@ -270,6 +320,15 @@ class RestaurantOrderBot {
         [orderGroupId]
       );
       const order = orders[0];
+      const [totalResult] = await this.pool.execute(`
+        SELECT SUM(mi.item_price * oi.quantity) AS total
+        FROM order_items oi
+        JOIN menu_items mi ON oi.menu_item_id = mi.id
+        WHERE oi.order_group_id = ?
+      `, [orderGroupId]);
+      
+      const totalAmount = totalResult[0].total || 0;
+      message += `\nTotal Amount: $${totalAmount.toFixed(2)}`;
 
       const [orderItems] = await this.pool.execute(`
         SELECT 
@@ -287,10 +346,15 @@ class RestaurantOrderBot {
         WHERE oi.order_group_id = ?
       `, [orderGroupId]);
 
+      
+
       let message = `Group Order Details\nGroup ID: ${orderGroupId}\nStatus: ${order.status}\nRestaurant: ${await this.getRestaurantName(order.restaurant_id)}\n\n`;
 
       const workerOrders = {};
       orderItems.forEach(item => {
+        const itemTotal = item.item_price * item.quantity;
+        totalAmount += itemTotal;
+
         if (!workerOrders[item.worker_name]) {
           workerOrders[item.worker_name] = [];
         }
@@ -302,8 +366,11 @@ class RestaurantOrderBot {
         items.forEach(item => {
           message += `  • ${item.item_name} x${item.quantity} - $${(item.item_price * item.quantity).toFixed(2)}\n`;
           message += `    Status: ${item.is_paid ? 'Paid' : 'Unpaid'}\n`;
+          
         });
         message += `\n`;
+        message += `\nTotal Amount: $${totalAmount.toFixed(2)}`;
+
       }
 
       const statusOptions = ['pending', 'approved', 'rejected', 'completed', 'outForDelivery', 'arrived'];
@@ -376,10 +443,16 @@ class RestaurantOrderBot {
   async viewGroupOrders(chatId) {
     try {
       const [groupOrders] = await this.pool.execute(`
-        SELECT o.order_group_id, r.name AS restaurant_name, o.status
+        SELECT 
+          o.order_group_id, 
+          r.name AS restaurant_name, 
+          o.status,
+          SUM(mi.item_price * oi.quantity) AS total_amount
         FROM orders o
-        JOIN restaurants r ON o.restaurant_id = r.id
-        WHERE r.admin_id = ? AND o.is_admin_created = TRUE
+        JOIN order_items oi ON o.id = oi.order_id
+        JOIN menu_items mi ON oi.menu_item_id = mi.id
+        WHERE o.admin_id = ?
+        GROUP BY o.order_group_id
       `, [chatId]);
 
       if (groupOrders.length === 0) {
@@ -409,16 +482,26 @@ class RestaurantOrderBot {
     const connection = await this.pool.getConnection();
 
     try {
+
       await connection.query(`
-        CREATE TABLE IF NOT EXISTS users (
-          id INT AUTO_INCREMENT PRIMARY KEY, 
-          user_id BIGINT UNIQUE NOT NULL,
-          role ENUM('admin', 'worker') NOT NULL DEFAULT 'worker',
-          name VARCHAR(255) NOT NULL,
-          phone_number VARCHAR(20) NOT NULL,
-          uuid VARCHAR(36) UNIQUE NOT NULL
+        CREATE TABLE IF NOT EXISTS companies (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          name VARCHAR(255) NOT NULL UNIQUE
         )
       `);
+
+ await connection.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id INT AUTO_INCREMENT PRIMARY KEY, 
+      user_id BIGINT UNIQUE NOT NULL,
+      role ENUM('admin', 'worker') NOT NULL DEFAULT 'worker',
+      name VARCHAR(255) NOT NULL,
+      phone_number VARCHAR(20) NOT NULL,
+      uuid VARCHAR(36) UNIQUE NOT NULL,
+      company_id INT,
+      FOREIGN KEY (company_id) REFERENCES companies(id)
+    )
+  `);
 
       await connection.query(`
         CREATE TABLE IF NOT EXISTS restaurants (
@@ -544,27 +627,83 @@ class RestaurantOrderBot {
     const chatId = msg.chat.id;
     const phoneNumber = msg.text;
     const userState = this.getUserState(chatId);
-
-    const phoneRegex = /^\+\d{1,15}$/;
-    if (!phoneRegex.test(phoneNumber)) {
-      await this.bot.sendMessage(chatId, 'Invalid phone number format. Please use international format (e.g., +1234567890).');
-      return;
-    }
-
-    const uuid = uuidv4();
-
+  
     try {
-      await this.pool.execute(
-        'INSERT INTO users (user_id, role, name, phone_number, uuid) VALUES (?, ?, ?, ?, ?)', 
-        [chatId, userState.role, userState.name, phoneNumber, uuid]
-      );
-
-      this.clearUserState(chatId);
-      await this.showRoleMenu(chatId, userState.role);
-      await this.bot.sendMessage(chatId, `Successfully registered as ${userState.role}! Your UUID is: ${uuid}`);
+      // Validate phone number format
+      const phoneRegex = /^\+\d{1,15}$/;
+      if (!phoneRegex.test(phoneNumber)) {
+        await this.bot.sendMessage(chatId, '❌ Invalid phone format! Use international format (+1234567890)');
+        return;
+      }
+  
+      // Handle different registration flows
+      if (userState.role === 'worker') {
+        // Worker registration flow
+        this.setUserState(chatId, {
+          ...userState,
+          phoneNumber: phoneNumber,
+          expecting: 'restaurant_selection'
+        });
+        const [companies] = await this.pool.execute('SELECT id, name FROM companies');
+ 
+      if (companies.length === 0) {
+        await this.bot.sendMessage(chatId, 'No companies available.');
+        return;
+      }
+    
+      const keyboard = {
+        inline_keyboard: companies.map(c => [
+          { text: c.name, callback_data: `select_company_${c.id}` }
+        ])
+      };
+    
+      this.setUserState(chatId, { ...userState, expecting: 'company_selection' });
+      await this.bot.sendMessage(chatId, 'Select your company:', { reply_markup: keyboard });
+    } else if (userState.role === 'admin') {
+        const uuid = uuidv4();
+        
+        const [existingAdmin] = await this.pool.execute(
+          'SELECT user_id FROM users WHERE role = "admin" AND user_id = ?',
+          [chatId]
+        );
+  
+        if (existingAdmin.length > 0) {
+          await this.bot.sendMessage(chatId, '⚠️ Admin already registered!');
+          this.clearUserState(chatId);
+          return;
+        }
+  
+        await this.pool.execute(
+          `INSERT INTO users 
+           (user_id, role, name, phone_number, uuid, company_id) 
+           VALUES (?, ?, ?, ?, ?, NULL)`, 
+          [chatId, 'admin', userState.name, phoneNumber, uuid]
+        );
+        
+     // After inserting admin with NULL company_id
+this.setUserState(chatId, { ...userState, expecting: 'company_name' });
+await this.bot.sendMessage(chatId, 'Enter your company name:');
+      
+  
+        // Clear state and show admin menu //
+      //  this.clearUserState(chatId);
+      //  await this.showRoleMenu(chatId, 'admin');
+      //  await this.bot.sendMessage(
+      //    chatId,
+      //    `✅ Admin registration successful!\n` +
+      //    `🔑 Your UUID: ${uuid}\n` +
+      //    `You can now manage restaurants and orders.`
+      //  );
+      ///////////////////////////////////////////////////////////////////////
+        logger.info(`New admin registered: ${userState.name} (${chatId})`);
+      }
     } catch (error) {
       logger.error('Registration error:', error);
-      await this.bot.sendMessage(chatId, 'Registration failed. Please try again.');
+      await this.bot.sendMessage(
+        chatId,
+        '❌ Registration failed. Please try again or contact support.'
+      );
+      this.clearUserState(chatId);
     }
   }
 
@@ -613,6 +752,20 @@ class RestaurantOrderBot {
       case 'Logout':
         await this.logout(chatId);
         break;
+        case 'select_restaurant_':
+          // Replace with company selection
+          const companyId = data.split('_')[2];
+          await this.pool.execute(
+            'UPDATE users SET company_id = ? WHERE user_id = ?',
+            [companyId, chatId]
+          );
+          this.clearUserState(chatId);
+          await this.showRoleMenu(chatId, 'worker');
+          await this.bot.sendMessage(
+            chatId,
+            `✅ Registered with company ID ${companyId}`
+          );
+          break;
     }
   }
 
@@ -639,22 +792,13 @@ class RestaurantOrderBot {
   }
 
   async processAddRestaurant(msg) {
-    const chatId = msg.chat.id;
-    const restaurantName = msg.text;
     const user = await this.getUserByTelegramId(chatId);
+    const companyId = user.company_id;
 
-    try {
-      await this.pool.execute(
-        'INSERT INTO restaurants (name, admin_id) VALUES (?, ?)', 
-        [restaurantName, chatId]
-      );
-
-      this.clearUserState(chatId);
-      await this.bot.sendMessage(chatId, `Restaurant "${restaurantName}" added successfully!`);
-    } catch (error) {
-      logger.error('Add restaurant error:', error);
-      await this.bot.sendMessage(chatId, 'Failed to add restaurant. Please try again.');
-    }
+    await this.pool.execute(
+      'INSERT INTO restaurants (name, admin_id, company_id) VALUES (?, ?, ?)',
+      [restaurantName, chatId, companyId]
+    );
   }
 
   async initiateAddMenuItem(chatId) {
@@ -777,13 +921,14 @@ class RestaurantOrderBot {
   async initiateViewWorkerGroupOrders(chatId) {
     try {
       const [groupOrders] = await this.pool.execute(`
-        SELECT DISTINCT o.order_group_id, r.name AS restaurant_name
+        SELECT o.order_group_id, r.name AS restaurant_name, o.status
         FROM orders o
-        JOIN order_items oi ON o.id = oi.order_id
         JOIN restaurants r ON o.restaurant_id = r.id
-        WHERE oi.worker_id = ? AND o.is_admin_created = TRUE
+        JOIN companies c ON r.company_id = c.id
+        JOIN users u ON c.id = u.company_id
+        WHERE u.user_id = ? AND o.status = 'open'
       `, [chatId]);
-
+      
       if (groupOrders.length === 0) {
         await this.bot.sendMessage(chatId, 'No group orders found.');
         return;
@@ -808,13 +953,15 @@ class RestaurantOrderBot {
   }
 
   async initiateJoinGroupOrder(chatId) {
+    const user = await this.getUserByTelegramId(chatId);
+    const companyId = user.company_id;
     try {
       const [groupOrders] = await this.pool.execute(`
-        SELECT o.order_group_id, r.name AS restaurant_name, o.status
+        SELECT o.order_group_id, r.name AS restaurant_name, o.status 
         FROM orders o
         JOIN restaurants r ON o.restaurant_id = r.id
-        WHERE o.is_admin_created = TRUE AND o.status = 'open'
-      `);
+        WHERE r.company_id = ? AND o.is_admin_created = TRUE AND o.status = 'open'
+      `, [companyId]);
 
       if (groupOrders.length === 0) {
         await this.bot.sendMessage(chatId, 'No open group orders available.');
